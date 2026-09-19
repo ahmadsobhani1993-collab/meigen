@@ -4,12 +4,13 @@ import json
 import io
 import time
 import os
+import hashlib
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL_ID = "-1003790089817"
 STATUS_FILE = "sent_prompts.json"
 MAX_HISTORY_LIMIT = 2000
-POSTS_PER_RUN = 3  # تعداد پرامپت ارسالی در هر نوبت اجرا
+POSTS_PER_RUN = 3
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -22,6 +23,15 @@ scraper = cloudscraper.create_scraper(browser={'browser': 'chrome', 'platform': 
 
 def escape_html(text):
     return text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+
+def make_fingerprint(prompt_text, image_url):
+    """تولید یک کلید هش منحصر‌به‌فرد از متن پرامپت و نام فایل عکس"""
+    # استخراج نام فایل از انتهای آدرس عکس بدون پارامترها
+    img_name = image_url.split('?')[0].split('/')[-1]
+    # تمیزسازی متن پرامپت برای مقایسه دقیق
+    clean_prompt = " ".join(prompt_text.strip().split())
+    raw_key = f"{clean_prompt}::{img_name}"
+    return hashlib.md5(raw_key.encode('utf-8')).hexdigest()
 
 def load_sent_prompts():
     if os.path.exists(STATUS_FILE):
@@ -80,33 +90,24 @@ def send_photo_file_to_telegram(photo_url, prompt_text):
         return False
 
 def fetch_prompts_from_api(total_pages=3):
-    """
-    فراخوانی مستقیم اندپوینت رسمی Meigen
-    """
     all_items = []
     seen = set()
 
     for p in range(total_pages):
         offset = p * 20
-        # استفاده از sort=newest برای دریافت جدیدترین‌ها (یا sort=featured)
         api_url = f"https://www.meigen.ai/api/images?offset={offset}&limit=20&sort=newest"
-        print(f"📡 واکشی از API: offset={offset}...")
         
         try:
             res = scraper.get(api_url, headers=HEADERS, timeout=15)
             if res.status_code != 200:
-                print(f"⚠️ پاسخ نامعتبر API: وضعیت {res.status_code}")
                 break
                 
             data = res.json()
-            
-            # استخراج لیست آیتم‌ها بر اساس ساختارهای متداول JSON
             items = data if isinstance(data, list) else (
                 data.get("images") or data.get("data") or data.get("items") or []
             )
 
             if not items:
-                print("ℹ️ محتوای بیشتری در این آفست وجود ندارد.")
                 break
 
             for it in items:
@@ -117,7 +118,6 @@ def fetch_prompts_from_api(total_pages=3):
                     or it.get("caption")
                 )
                 
-                # استخراج آدرس تصویر با بالاترین کیفیت
                 img = (
                     it.get("url")
                     or it.get("image_url")
@@ -126,53 +126,46 @@ def fetch_prompts_from_api(total_pages=3):
                     or (it.get("image") if isinstance(it.get("image"), str) else None)
                 )
 
-                # شناسه یکتا برای رد کردن تکراری‌ها
-                item_id = str(it.get("id") or prompt)
-
-                if prompt and img and item_id not in seen:
-                    seen.add(item_id)
-                    all_items.append({
-                        "id": item_id,
-                        "prompt": prompt,
-                        "image_url": img
-                    })
+                if prompt and img:
+                    fp = make_fingerprint(prompt, img)
+                    if fp not in seen:
+                        seen.add(fp)
+                        all_items.append({
+                            "fingerprint": fp,
+                            "prompt": prompt,
+                            "image_url": img
+                        })
 
         except Exception as e:
-            print(f"❌ خطا در پردازش پاسخ API: {e}")
+            print(f"❌ خطا در خواندن API: {e}")
             break
 
-    print(f"🎯 مجموعاً {len(all_items)} پرامپت با موفقیت از API استخراج شد.")
     return all_items
 
 if __name__ == "__main__":
     if not TELEGRAM_BOT_TOKEN:
-        print("❌ متغیر TELEGRAM_BOT_TOKEN مقداردهی نشده است.")
+        print("❌ متغیر TELEGRAM_BOT_TOKEN تعریف نشده.")
         exit(1)
 
     sent_set, sent_list = load_sent_prompts()
-    
-    # واکشی پرامپت‌ها از طریق API (۳ صفحه اول = ۶۰ مورد)
     prompts_pool = fetch_prompts_from_api(total_pages=3)
 
-    # فیلتر مواردی که هنوز ارسال نشده‌اند
-    unsend_items = [item for item in prompts_pool if item["id"] not in sent_set and item["prompt"] not in sent_set]
-    print(f"📋 تعداد پرامپت‌های آماده ارسال: {len(unsend_items)}")
-
-    # اگر می‌خواهید از قدیمی‌ترین‌های این لیست شروع کند، خط زیر را فعال کنید:
-    # unsend_items.reverse()
+    # فیلتر فقط مواردی که هش متن و عکسشان در سابقه نیست
+    unsend_items = [item for item in prompts_pool if item["fingerprint"] not in sent_set]
+    print(f"📋 کل پرامپت‌های واکشی شده: {len(prompts_pool)} | جدید و ارسال‌نشده: {len(unsend_items)}")
 
     new_count = 0
     for item in unsend_items:
         if new_count >= POSTS_PER_RUN:
             break
 
+        fp = item["fingerprint"]
         print(f"📦 ارسال [{new_count + 1}/{POSTS_PER_RUN}]...")
         
         if send_photo_file_to_telegram(item["image_url"], item["prompt"]):
-            print(f"✅ با موفقیت ارسال شد (ID: {item['id']})")
-            sent_set.add(item["id"])
-            sent_set.add(item["prompt"])
-            sent_list.append(item["id"])
+            print(f"✅ ارسال موفق (Hash: {fp[:8]}...)")
+            sent_set.add(fp)
+            sent_list.append(fp)
             new_count += 1
             time.sleep(4)
         else:
@@ -180,6 +173,6 @@ if __name__ == "__main__":
 
     if new_count > 0:
         save_sent_prompts(sent_list)
-        print(f"🏁 {new_count} پرامپت با موفقیت ارسال و در دیتابیس ثبت شد.")
+        print(f"🏁 {new_count} پرامپت ارسال و ذخیره شد.")
     else:
         print("💤 هیچ پرامپت جدیدی برای ارسال وجود نداشت.")
