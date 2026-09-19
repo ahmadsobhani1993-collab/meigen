@@ -9,9 +9,9 @@ import hashlib
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL_ID = "-1003790089817"
 STATUS_FILE = "sent_prompts.json"
-MAX_HISTORY_LIMIT = 5000
-MAX_POSTS_PER_RUN = 3
-TOTAL_PAGES_TO_SCAN = 5
+MAX_HISTORY_LIMIT = 50000
+MAX_POSTS_PER_RUN = 20
+TOTAL_PAGES_TO_SCAN = 3
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
