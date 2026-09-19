@@ -2,7 +2,6 @@ name: Auto Scrape Meigen to Telegram
 
 on:
   schedule:
-    # هر یک ساعت یک‌بار سر دقیقه 0
     - cron: '0 * * * *'
   workflow_dispatch:
 
@@ -16,8 +15,6 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -35,10 +32,24 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         run: python main.py
 
-      - name: Commit and push sent_prompts.json
-        uses: stefanzweifel/git-auto-commit-action@v5
-        with:
-          commit_message: "chore: update sent prompts [skip ci]"
-          file_pattern: "sent_prompts.json"
-          commit_user_name: "github-actions[bot]"
-          commit_user_email: "github-actions[bot]@users.noreply.github.com"
+      - name: Commit and Force Push Database
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # بررسی اینکه آیا فایلی تغییر کرده است یا خیر
+          if [ -n "$(git status --porcelain sent_prompts.json)" ]; then
+            echo "ذخیره تغییرات sent_prompts.json..."
+            # دریافت آخرین وضعیت ریموت برای جلوگیری از ناهمگامی
+            git fetch origin main
+            git checkout origin/main -- sent_prompts.json || true
+            
+            # اجرای مجدد ذخیره دیتای تولید شده
+            git add sent_prompts.json
+            git commit -m "chore: update sent prompts [skip ci]" || exit 0
+            
+            # پوش با هندلینگ همگام‌سازی مستقیم
+            git push origin HEAD:main
+          else
+            echo "تغییری در دیتابیس ایجاد نشد."
+          fi
