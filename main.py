@@ -5,6 +5,7 @@ import io
 import time
 import os
 import hashlib
+import re
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL_ID = "-1003790089817"
@@ -24,23 +25,31 @@ scraper = cloudscraper.create_scraper(browser={'browser': 'chrome', 'platform': 
 def escape_html(text):
     return text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
 
-def make_fingerprint(prompt_text, image_url):
-    """تولید یک کلید هش منحصر‌به‌فرد از متن پرامپت و نام فایل عکس"""
-    # استخراج نام فایل از انتهای آدرس عکس بدون پارامترها
-    img_name = image_url.split('?')[0].split('/')[-1]
-    # تمیزسازی متن پرامپت برای مقایسه دقیق
-    clean_prompt = " ".join(prompt_text.strip().split())
-    raw_key = f"{clean_prompt}::{img_name}"
-    return hashlib.md5(raw_key.encode('utf-8')).hexdigest()
+def normalize_prompt(prompt_text):
+    """حذف فاصله‌های اضافی و یکدست‌سازی متن برای مقایسه دقیق"""
+    if not prompt_text:
+        return ""
+    # تبدیل همه فاصله‌ها و شکست‌های خط به یک فاصله ساده و کوچک‌سازی حروف
+    text = re.sub(r'\s+', ' ', str(prompt_text)).strip().lower()
+    return text
+
+def make_prompt_hash(prompt_text):
+    """تولید هش یکتا فقط و فقط از روی متن تمیزشده پرامپت"""
+    clean_text = normalize_prompt(prompt_text)
+    return hashlib.md5(clean_text.encode('utf-8')).hexdigest()
 
 def load_sent_prompts():
     if os.path.exists(STATUS_FILE):
         try:
             with open(STATUS_FILE, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-                return set(data), list(data)
-        except Exception:
+                sent_set = set(data)
+                print(f"📖 سابقه خوانده شد: {len(sent_set)} هش در تاریخچه ثبت است.")
+                return sent_set, list(data)
+        except Exception as e:
+            print(f"⚠️ خطا در خواندن سابقه: {e}")
             return set(), []
+    print("⚠️ فایل سابقه یافت نشد، ایجاد صف جدید...")
     return set(), []
 
 def save_sent_prompts(sent_list):
@@ -91,7 +100,7 @@ def send_photo_file_to_telegram(photo_url, prompt_text):
 
 def fetch_prompts_from_api(total_pages=3):
     all_items = []
-    seen = set()
+    seen_hashes = set()
 
     for p in range(total_pages):
         offset = p * 20
@@ -127,11 +136,11 @@ def fetch_prompts_from_api(total_pages=3):
                 )
 
                 if prompt and img:
-                    fp = make_fingerprint(prompt, img)
-                    if fp not in seen:
-                        seen.add(fp)
+                    p_hash = make_prompt_hash(prompt)
+                    if p_hash not in seen_hashes:
+                        seen_hashes.add(p_hash)
                         all_items.append({
-                            "fingerprint": fp,
+                            "hash": p_hash,
                             "prompt": prompt,
                             "image_url": img
                         })
@@ -150,22 +159,22 @@ if __name__ == "__main__":
     sent_set, sent_list = load_sent_prompts()
     prompts_pool = fetch_prompts_from_api(total_pages=3)
 
-    # فیلتر فقط مواردی که هش متن و عکسشان در سابقه نیست
-    unsend_items = [item for item in prompts_pool if item["fingerprint"] not in sent_set]
-    print(f"📋 کل پرامپت‌های واکشی شده: {len(prompts_pool)} | جدید و ارسال‌نشده: {len(unsend_items)}")
+    # فیلتر قطعی بر اساس هش متن خالص
+    unsend_items = [item for item in prompts_pool if item["hash"] not in sent_set]
+    print(f"📋 تعداد کل واکشی شده: {len(prompts_pool)} | موارد جدید بدون تکرار: {len(unsend_items)}")
 
     new_count = 0
     for item in unsend_items:
         if new_count >= POSTS_PER_RUN:
             break
 
-        fp = item["fingerprint"]
-        print(f"📦 ارسال [{new_count + 1}/{POSTS_PER_RUN}]...")
+        h = item["hash"]
+        print(f"📦 در حال ارسال [{new_count + 1}/{POSTS_PER_RUN}] با هش {h[:8]}...")
         
         if send_photo_file_to_telegram(item["image_url"], item["prompt"]):
-            print(f"✅ ارسال موفق (Hash: {fp[:8]}...)")
-            sent_set.add(fp)
-            sent_list.append(fp)
+            print(f"✅ ارسال موفق به کانال")
+            sent_set.add(h)
+            sent_list.append(h)
             new_count += 1
             time.sleep(4)
         else:
@@ -173,6 +182,6 @@ if __name__ == "__main__":
 
     if new_count > 0:
         save_sent_prompts(sent_list)
-        print(f"🏁 {new_count} پرامپت ارسال و ذخیره شد.")
+        print(f"🏁 {new_count} پرامپت ارسال و هش آن‌ها ذخیره شد.")
     else:
-        print("💤 هیچ پرامپت جدیدی برای ارسال وجود نداشت.")
+        print("💤 هیچ پرامپت جدیدی یافت نشد.")
