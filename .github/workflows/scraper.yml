@@ -1,51 +1,23 @@
-name: Auto Scrape Meigen to Telegram
-
-on:
-  schedule:
-    - cron: '0 * * * *'
-  workflow_dispatch:
-
-permissions:
-  contents: write
-
-jobs:
-  scrape-and-post:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          cache: 'pip'
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Run Scraper Script
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-        run: python main.py
-
-      - name: Commit and Push sent_prompts.json
+- name: Commit and Push sent_prompts.json
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           
-          # اضافه کردن فایل سابقه
+          # دریافت آخرین وضعیت مخزن از گیت‌هاب بدون بازنویسی فایل محلی
+          git fetch origin main
+          
+          # استیج کردن فایل تغییر یافته
           git add sent_prompts.json
           
-          # اگر تغییری در فایل رخ داده باشد، کامیت و پوش شود
           if ! git diff --staged --quiet; then
-            echo "💾 فایل سابقه تغییر کرده، در حال کامیت و پوش..."
+            echo "💾 ثبت تغییرات در سابقه..."
             git commit -m "chore: update sent prompts [skip ci]"
-            git pull --rebase origin main
+            
+            # ادغام با اولویت کامل دادن به تغییرات رانر
+            git merge origin/main -X ours -m "chore: merge remote changes [skip ci]" || true
+            
+            # پوش نهایی
             git push origin HEAD:main
           else
-            echo "ℹ️ فایلی تغییر نکرده است."
+            echo "ℹ️ تغییری در فایل رخ نداده است."
           fi
