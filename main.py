@@ -10,8 +10,9 @@ import re
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL_ID = "-1003790089817"
 STATUS_FILE = "sent_prompts.json"
-MAX_HISTORY_LIMIT = 2000
-MAX_POSTS_PER_RUN = 3  # در هر نوبت نهایتاً ۳ پرامپت جدید بفرستد
+MAX_HISTORY_LIMIT = 3000
+MAX_POSTS_PER_RUN = 3  # سقف ارسال در هر نوبت اجرا
+TOTAL_PAGES_TO_SCAN = 5  # ۵ صفحه ۲۰تایی = ۱۰۰ پرامپت اخیر را بررسی می‌کند
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -26,7 +27,6 @@ def escape_html(text):
     return text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
 
 def clean_text_for_hash(text):
-    """حذف فاصله‌ها و علائم برای ساخت هش یکتا و غیرقابل خطا از متن پرامپت"""
     if not text:
         return ""
     text = text.lower()
@@ -92,21 +92,59 @@ def send_photo_file_to_telegram(photo_url, prompt_text):
         print(f"❌ خطای تلگرام: {e}")
         return False
 
-def fetch_latest_prompts():
-    """فقط جدیدترین پرامپت‌های بالای فید را دریافت می‌کند"""
-    api_url = "https://www.meigen.ai/api/images?offset=0&limit=25&sort=newest"
-    print("📡 در حال دریافت ۲۰ پرامپت تازه از بالای سایت...")
-    try:
-        res = scraper.get(api_url, headers=HEADERS, timeout=15)
-        if res.status_code == 200:
+def fetch_latest_prompts(pages=TOTAL_PAGES_TO_SCAN):
+    """واکشی چندین صفحه آفست برای پوشش تعداد بیشتر پرامپت‌ها"""
+    all_items = []
+    seen_in_batch = set()
+
+    for page in range(pages):
+        offset = page * 20
+        api_url = f"https://www.meigen.ai/api/images?offset={offset}&limit=20&sort=newest"
+        print(f"📡 واکشی آفست {offset}...")
+        
+        try:
+            res = scraper.get(api_url, headers=HEADERS, timeout=15)
+            if res.status_code != 200:
+                print(f"⚠️ وضعیت {res.status_code} در آفست {offset}")
+                break
+                
             data = res.json()
             items = data if isinstance(data, list) else (
                 data.get("images") or data.get("data") or data.get("items") or []
             )
-            return items
-    except Exception as e:
-        print(f"❌ خطای اتصال به API: {e}")
-    return []
+
+            if not items:
+                break
+
+            for it in items:
+                prompt = (
+                    it.get("prompt")
+                    or it.get("prompt_text")
+                    or it.get("description")
+                    or it.get("caption")
+                )
+                img = (
+                    it.get("url")
+                    or it.get("image_url")
+                    or it.get("imageUrl")
+                    or it.get("src")
+                )
+
+                if prompt and img:
+                    p_hash = make_prompt_hash(prompt)
+                    if p_hash not in seen_in_batch:
+                        seen_in_batch.add(p_hash)
+                        all_items.append({
+                            "hash": p_hash,
+                            "prompt": prompt,
+                            "image_url": img
+                        })
+
+        except Exception as e:
+            print(f"❌ خطا در آفست {offset}: {e}")
+            break
+
+    return all_items
 
 if __name__ == "__main__":
     if not TELEGRAM_BOT_TOKEN:
@@ -114,47 +152,31 @@ if __name__ == "__main__":
         exit(1)
 
     sent_set, sent_list = load_sent_prompts()
-    latest_items = fetch_latest_prompts()
+    
+    # واکشی ۱۰۰ مورد اخیر (۵ صفحه ۲۰تایی)
+    latest_items = fetch_latest_prompts(pages=TOTAL_PAGES_TO_SCAN)
 
     if not latest_items:
-        print("⚠️ دیتایی از سایت دریافت نشد.")
+        print("⚠️ دیتایی دریافت نشد.")
         exit(0)
 
-    print(f"🔍 تعداد {len(latest_items)} پرامپت دریافت شد. بررسی به ترتیب از جدیدترین...")
+    print(f"🔍 مجموعاً {len(latest_items)} پرامپت بدون تکرار واکشی شد. بررسی برای ارسال...")
 
     sent_count = 0
 
-    # بررسی یکی‌یکی از جدیدترین به قدیمی‌تر
     for idx, it in enumerate(latest_items):
         if sent_count >= MAX_POSTS_PER_RUN:
-            print(f"🛑 سقف ارسال این نوبت ({MAX_POSTS_PER_RUN}) پر شد.")
+            print(f"🛑 سقف ارسال این نوبت ({MAX_POSTS_PER_RUN}) تکمیل شد.")
             break
 
-        prompt = (
-            it.get("prompt")
-            or it.get("prompt_text")
-            or it.get("description")
-            or it.get("caption")
-        )
-        img = (
-            it.get("url")
-            or it.get("image_url")
-            or it.get("imageUrl")
-            or it.get("src")
-        )
+        p_hash = it["hash"]
 
-        if not prompt or not img:
-            continue
-
-        p_hash = make_prompt_hash(prompt)
-
-        # اگر قبلاً ارسال شده، اسکیپ کن
+        # اگر قبلاً در سابقه بود، اسکیپ شود
         if p_hash in sent_set:
             continue
 
-        # اگر قبلاً ارسال نشده، بفرست
-        print(f"📦 [آیتم #{idx+1}] پرامپت جدید کشف شد! در حال ارسال به کانال...")
-        if send_photo_file_to_telegram(img, prompt):
+        print(f"📦 [آیتم #{idx+1}] پرامپت ارسال‌نشده پیدا شد! ارسال به کانال...")
+        if send_photo_file_to_telegram(it["image_url"], it["prompt"]):
             print("✅ با موفقیت ارسال شد.")
             sent_set.add(p_hash)
             sent_list.append(p_hash)
@@ -165,6 +187,6 @@ if __name__ == "__main__":
 
     if sent_count > 0:
         save_sent_prompts(sent_list)
-        print(f"🏁 {sent_count} پرامپت جدید با موفقیت به کانال ارسال شد.")
+        print(f"🏁 {sent_count} پرامپت جدید با موفقیت ارسال و در دیتابیس ثبت شد.")
     else:
-        print("💤 هیچ پرامپت جدیدی نسبت به سابقه قبلی وجود نداشت (همه اسکیپ شدند).")
+        print(f"💤 تمام {len(latest_items)} مورد بررسی‌شده قبلاً ارسال شده بودند.")
