@@ -32,24 +32,20 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         run: python main.py
 
-      - name: Commit and Force Push Database
+      - name: Commit and Push sent_prompts.json
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           
-          # بررسی اینکه آیا فایلی تغییر کرده است یا خیر
-          if [ -n "$(git status --porcelain sent_prompts.json)" ]; then
-            echo "ذخیره تغییرات sent_prompts.json..."
-            # دریافت آخرین وضعیت ریموت برای جلوگیری از ناهمگامی
-            git fetch origin main
-            git checkout origin/main -- sent_prompts.json || true
-            
-            # اجرای مجدد ذخیره دیتای تولید شده
-            git add sent_prompts.json
-            git commit -m "chore: update sent prompts [skip ci]" || exit 0
-            
-            # پوش با هندلینگ همگام‌سازی مستقیم
+          # اضافه کردن فایل سابقه
+          git add sent_prompts.json
+          
+          # اگر تغییری در فایل رخ داده باشد، کامیت و پوش شود
+          if ! git diff --staged --quiet; then
+            echo "💾 فایل سابقه تغییر کرده، در حال کامیت و پوش..."
+            git commit -m "chore: update sent prompts [skip ci]"
+            git pull --rebase origin main
             git push origin HEAD:main
           else
-            echo "تغییری در دیتابیس ایجاد نشد."
+            echo "ℹ️ فایلی تغییر نکرده است."
           fi
