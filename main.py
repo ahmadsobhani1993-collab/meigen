@@ -5,12 +5,11 @@ import io
 import time
 import os
 import hashlib
-import re
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL_ID = "-1003790089817"
 STATUS_FILE = "sent_prompts.json"
-MAX_HISTORY_LIMIT = 3000
+MAX_HISTORY_LIMIT = 5000
 MAX_POSTS_PER_RUN = 3
 TOTAL_PAGES_TO_SCAN = 5
 
@@ -26,24 +25,26 @@ scraper = cloudscraper.create_scraper(browser={'browser': 'chrome', 'platform': 
 def escape_html(text):
     return text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
 
-def clean_text_for_hash(text):
-    if not text:
-        return ""
-    text = text.lower()
-    return re.sub(r'[^a-z0-9\u0600-\u06FF]', '', text)
-
-def make_prompt_hash(prompt_text):
-    clean = clean_text_for_hash(prompt_text)
-    return hashlib.md5(clean.encode('utf-8')).hexdigest()
+def make_unique_key(item_id, prompt_text):
+    """
+    تولید شناسه کاملاً یکتا بر اساس شناسه ثابت تصویر در سایت و متن پرامپت
+    """
+    clean_prompt = " ".join(str(prompt_text).strip().split()).lower()
+    raw = f"{str(item_id).strip()}::{clean_prompt}"
+    return hashlib.sha256(raw.encode('utf-8')).hexdigest()
 
 def load_sent_prompts():
     if os.path.exists(STATUS_FILE):
         try:
             with open(STATUS_FILE, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-                return set(data), list(data)
-        except Exception:
+                s_set = set(data)
+                print(f"📖 سابقه خوانده شد: {len(s_set)} پست قبلاً ثبت شده است.")
+                return s_set, list(data)
+        except Exception as e:
+            print(f"⚠️ خطا در خواندن سابقه: {e}")
             return set(), []
+    print("📖 فایل سابقه‌ای وجود ندارد، ایجاد فایل جدید...")
     return set(), []
 
 def save_sent_prompts(sent_list):
@@ -58,7 +59,7 @@ def send_photo_file_to_telegram(photo_url, prompt_text):
     try:
         img_res = requests.get(photo_url, headers=HEADERS, timeout=25)
         if img_res.status_code != 200:
-            print(f"❌ دانلود عکس ناموفق: {img_res.status_code}")
+            print(f"❌ دانلود عکس ناموفق: وضعیت {img_res.status_code}")
             return False
             
         file_data = io.BytesIO(img_res.content)
@@ -98,47 +99,34 @@ def fetch_prompts():
 
     for page in range(TOTAL_PAGES_TO_SCAN):
         offset = page * 20
-        # استفاده از sort=featured طبق درخواست شبکه شما
-        api_url = f"https://www.meigen.ai/api/images?offset={offset}&limit=20&sort=featured"
-        print(f"📡 درخواست به: offset={offset} (sort=featured)...")
+        # فراخوانی با sort=popular یا بدون سورت برای جلوگیری از shuffle شدن نتایج
+        api_url = f"https://www.meigen.ai/api/images?offset={offset}&limit=20"
         
         try:
             res = scraper.get(api_url, headers=HEADERS, timeout=15)
-            print(f"   وضعیت پاسخ: {res.status_code}")
-            
             if res.status_code != 200:
-                print(f"   ⚠️ پاسخ نامعتبر، رد شدن از صفحه...")
                 continue
                 
             data = res.json()
-            
-            # پیدا کردن آرایه داده‌ها در خروجی جیسون
             items = []
             if isinstance(data, list):
                 items = data
             elif isinstance(data, dict):
-                # لاگ کلیدهای اصلی جیسون دریافتی برای شفافیت
-                print(f"   کلیدهای موجود در پاسخ: {list(data.keys())}")
-                for key in ['images', 'data', 'items', 'rows', 'results']:
+                for key in ['images', 'data', 'items']:
                     if isinstance(data.get(key), list):
                         items = data[key]
                         break
-
-            print(f"   تعداد آیتم‌های استخراج شده از این صفحه: {len(items)}")
 
             if not items:
                 break
 
             for it in items:
-                # استخراج متن پرامپت از فیلدهای محتمل
                 prompt = (
                     it.get("prompt")
                     or it.get("prompt_text")
                     or it.get("description")
                     or it.get("caption")
                 )
-                
-                # استخراج آدرس تصویر
                 img = (
                     it.get("url")
                     or it.get("image_url")
@@ -146,19 +134,20 @@ def fetch_prompts():
                     or it.get("src")
                     or (it.get("image") if isinstance(it.get("image"), str) else None)
                 )
+                item_id = it.get("id") or it.get("_id") or it.get("imageId") or prompt
 
                 if prompt and img:
-                    p_hash = make_prompt_hash(prompt)
-                    if p_hash not in seen_in_batch:
-                        seen_in_batch.add(p_hash)
+                    ukey = make_unique_key(item_id, prompt)
+                    if ukey not in seen_in_batch:
+                        seen_in_batch.add(ukey)
                         all_items.append({
-                            "hash": p_hash,
+                            "key": ukey,
                             "prompt": prompt,
                             "image_url": img
                         })
 
         except Exception as e:
-            print(f"   ❌ خطا در خواندن این آفست: {e}")
+            print(f"   ❌ خطا در آفست {offset}: {e}")
 
     return all_items
 
@@ -171,29 +160,29 @@ if __name__ == "__main__":
     latest_items = fetch_prompts()
 
     if not latest_items:
-        print("⚠️ دیتایی دریافت نشد. لاگ‌های کلیدهای بالا را بررسی کنید.")
+        print("⚠️ دیتایی دریافت نشد.")
         exit(0)
 
-    print(f"🔍 مجموعاً {len(latest_items)} پرامپت معتبر واکشی شد. بررسی برای ارسال...")
+    print(f"🔍 مجموعاً {len(latest_items)} پرامپت منحصر‌به‌فرد از سایت واکشی شد.")
 
     sent_count = 0
 
     for idx, it in enumerate(latest_items):
         if sent_count >= MAX_POSTS_PER_RUN:
-            print(f"🛑 سقف ارسال این نوبت ({MAX_POSTS_PER_RUN}) پر شد.")
+            print(f"🛑 سقف ارسال این نوبت ({MAX_POSTS_PER_RUN}) تکمیل شد.")
             break
 
-        p_hash = it["hash"]
+        ukey = it["key"]
 
-        # اگر قبلاً ارسال شده بود، رد شو
-        if p_hash in sent_set:
+        # چک کردن سابقه
+        if ukey in sent_set:
             continue
 
-        print(f"📦 [آیتم #{idx+1}] در حال ارسال پرامپت جدید به کانال...")
+        print(f"📦 [آیتم #{idx+1}] پرامپت جدید و غیرتکراری پیدا شد! ارسال...")
         if send_photo_file_to_telegram(it["image_url"], it["prompt"]):
             print("✅ با موفقیت ارسال شد.")
-            sent_set.add(p_hash)
-            sent_list.append(p_hash)
+            sent_set.add(ukey)
+            sent_list.append(ukey)
             sent_count += 1
             time.sleep(4)
         else:
@@ -201,6 +190,6 @@ if __name__ == "__main__":
 
     if sent_count > 0:
         save_sent_prompts(sent_list)
-        print(f"🏁 {sent_count} پرامپت با موفقیت ارسال و در دیتابیس ثبت شد.")
+        print(f"🏁 {sent_count} پرامپت ارسال و کلید آن‌ها ذخیره شد.")
     else:
-        print(f"💤 تمام {len(latest_items)} پرامپت قبلاً در کانال ارسال شده بودند.")
+        print(f"💤 تمام {len(latest_items)} پرامپت واکشی‌شده قبلاً در کانال ارسال شده بودند.")
