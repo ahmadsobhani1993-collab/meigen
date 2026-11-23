@@ -7,19 +7,20 @@ import hashlib
 
 # ============================== تنظیمات ==============================
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-MEIGEN_API_TOKEN = os.environ.get("MEIGEN_API_TOKEN")  # اختیاری ولی توصیه می‌شود
+MEIGEN_API_TOKEN = os.environ.get("MEIGEN_API_TOKEN")  # اختیاری
 TELEGRAM_CHANNEL_ID = "-1003790089817"
 STATUS_FILE = "sent_prompts.json"
 MAX_HISTORY_LIMIT = 50000
 
-MAX_POSTS_PER_RUN = 10         # تعداد پست در هر اجرا
-SEND_DELAY_SECONDS = 4         # فاصله بین ارسال‌ها
-PAGES_PER_QUERY = 6            # هر صفحه ۳ نتیجه دارد
-CANDIDATE_BUFFER = 12          # آیتم اضافه، چون بعد از گرفتن متن کامل بعضی‌ها رد می‌شوند
-SKIP_REFERENCE_PROMPTS = True  # پرامپت‌هایی که به عکس آپلودی نیاز دارند رد شوند
-REQUIRE_FULL_PROMPT = True     # اگر متن کامل پیدا نشد، آیتم ارسال نشود
-ONLY_COMMUNITY = False         # اگر True شود فقط آیتم‌های community_ ارسال می‌شوند
-TELEGRAM_CHUNK = 3000          # برای پرامپت‌های خیلی بلند (سقف تلگرام ۴۰۹۶ است)
+MAX_POSTS_PER_RUN = 10          # تعداد پست در هر اجرا
+MAX_CHECKS_PER_RUN = 80         # حداکثر تعداد پرامپتی که در یک اجرا بررسی می‌شود
+SEND_DELAY_SECONDS = 4          # فاصله بین ارسال‌ها
+PAGES_PER_QUERY = 6             # هر صفحه ۳ نتیجه دارد
+
+MAX_PROMPT_CHARS = 3900         # بلندتر از این در یک حباب جا نمی‌شود → رد می‌شود
+CAPTION_MAX_CHARS = 900         # تا این طول، متن داخل کپشن عکس می‌آید؛ بیشتر → پیام ریپلای
+SKIP_REFERENCE_PROMPTS = True   # پرامپت‌هایی که به عکس آپلودی نیاز دارند رد شوند
+ONLY_COMMUNITY = False          # اگر True شود فقط آیتم‌های community_
 
 MCP_URL = "https://www.meigen.ai/api/mcp"
 
@@ -34,7 +35,7 @@ SEARCH_QUERIES = [
 REFERENCE_RE = re.compile(
     r"\[image\d*\]|uploaded (reference )?(photo|image|product)|reference photo|"
     r"attached (photo|image)|upload a clear|upload (your|a|the) (product )?(image|photo)|"
-    r"uploaded product",
+    r"uploaded product|uploaded client",
     re.I,
 )
 
@@ -77,6 +78,15 @@ def load_sent_prompts():
 def save_sent_prompts(sent_list):
     with open(STATUS_FILE, 'w', encoding='utf-8') as f:
         json.dump(sent_list[-MAX_HISTORY_LIMIT:], f, ensure_ascii=False, indent=2)
+
+
+def mark_done(it, sent_set, sent_list):
+    """آیتم را (ارسال‌شده یا ردشده) ثبت و فوراً ذخیره می‌کند."""
+    for k in (it["key"], it["legacy_key"], it["id_key"], it["img_key"]):
+        if k not in sent_set:
+            sent_set.add(k)
+            sent_list.append(k)
+    save_sent_prompts(sent_list)
 
 
 # ============================== کلاینت MCP ==============================
@@ -158,31 +168,29 @@ def parse_payload(result):
         return result["structuredContent"]
     for part in result.get("content", []):
         text = part.get("text") if isinstance(part, dict) else None
-        if text:
-            try:
-                return json.loads(text)
-            except Exception:
-                continue
+        if not text:
+            continue
+        try:
+            return json.loads(text)
+        except Exception:
+            # پاسخ get_inspiration یک جمله اول دارد و بعد JSON؛ از اولین { شروع می‌کنیم
+            start = text.find("{")
+            if start != -1:
+                try:
+                    return json.loads(text[start:])
+                except Exception:
+                    continue
     return {}
 
 
-# ============================== واکشی کاندیداها ==============================
-def fetch_candidates(client, sent_set):
-    needed = MAX_POSTS_PER_RUN + CANDIDATE_BUFFER
-    all_items, seen = [], set()
-    new_count = 0
-    printed_raw_debug = False
-    skipped_ref = skipped_dup = skipped_other = 0
-
+# ============================== کاندیداها (تنبل) ==============================
+def iter_new_candidates(client, sent_set):
+    """آیتم‌های جدید را یکی‌یکی و فقط به اندازه نیاز از جستجو بیرون می‌دهد."""
+    seen = set()
     for q in SEARCH_QUERIES:
-        if new_count >= needed:
-            break
         offset, snapshot_id = 0, None
 
         for page in range(PAGES_PER_QUERY):
-            if new_count >= needed:
-                break
-
             args = {"query": q, "offset": offset}
             if snapshot_id:
                 args["snapshotId"] = snapshot_id
@@ -190,54 +198,38 @@ def fetch_candidates(client, sent_set):
             try:
                 result = client.call("search_gallery", args)
             except Exception as e:
-                print(f"   ❌ خطا برای «{q}» صفحه {page+1}: {e}")
+                print(f"   ❌ خطا برای جستجوی «{q}» صفحه {page+1}: {e}")
                 break
 
             data = parse_payload(result)
-            entries = data.get("entries") or [] if isinstance(data, dict) else []
+            entries = (data.get("entries") or []) if isinstance(data, dict) else []
+            print(f"🔎 «{q}» صفحه {page+1} (offset {offset}) → {len(entries)} آیتم")
 
-            if not entries and not printed_raw_debug and page == 0:
-                printed_raw_debug = True
-                print("⚠️ پاسخ خام (بدون entry):", json.dumps(result, ensure_ascii=False)[:800])
-
-            page_new = 0
             for e in entries:
                 excerpt = e.get("promptExcerpt") or e.get("prompt")
                 img = e.get("previewUrl")
                 item_id = e.get("id")
                 if not excerpt or not img or not item_id:
-                    skipped_other += 1
                     continue
                 if ONLY_COMMUNITY and not str(item_id).startswith("community_"):
-                    skipped_other += 1
-                    continue
-                if SKIP_REFERENCE_PROMPTS and REFERENCE_RE.search(excerpt):
-                    skipped_ref += 1
                     continue
 
-                # کلید بر اساس گزیده ساخته می‌شود (همان روش اجرای قبل، برای ثبات سابقه)
+                id_key = "id:" + str(item_id).strip()
+                if id_key in seen:
+                    continue
+                seen.add(id_key)
+
                 ukey = make_prompt_key(excerpt)
                 legacy = make_unique_key(item_id, excerpt)
-                if ukey in seen:
-                    skipped_dup += 1
+                img_key = "img:" + hashlib.sha256(img.encode()).hexdigest()
+
+                if any(k in sent_set for k in (ukey, legacy, id_key, img_key)):
                     continue
-                seen.add(ukey)
 
-                is_new = (ukey not in sent_set) and (legacy not in sent_set)
-                if is_new:
-                    new_count += 1
-                    page_new += 1
-                all_items.append({
-                    "key": ukey,
-                    "legacy_key": legacy,
-                    "excerpt": excerpt,
-                    "image_url": img,
-                    "source_id": item_id,
-                    "is_new": is_new,
-                })
-
-            print(f"🔎 «{q}» صفحه {page+1} (offset {offset}) → {len(entries)} آیتم | "
-                  f"جدید در این صفحه: {page_new} | جدید تا اینجا: {new_count}/{needed}")
+                yield {
+                    "key": ukey, "legacy_key": legacy, "id_key": id_key, "img_key": img_key,
+                    "excerpt": excerpt, "image_url": img, "source_id": item_id,
+                }
 
             if not isinstance(data, dict) or not data.get("hasMore") or not entries:
                 break
@@ -245,15 +237,8 @@ def fetch_candidates(client, sent_set):
             snapshot_id = data.get("snapshotId") or snapshot_id
             time.sleep(0.5)
 
-    print(f"📊 واکشی کاندیداها: کل={len(all_items)} | جدید={new_count} | "
-          f"ردشده(مرجع آپلودی)={skipped_ref} | ردشده(تکراری)={skipped_dup} | ردشده(سایر)={skipped_other}")
-    return all_items
 
-
-# ============================== گرفتن متن کامل ==============================
-_debug_shown = 0
-
-
+# ============================== متن کامل ==============================
 def collect_texts(obj, out):
     if isinstance(obj, dict):
         for k, v in obj.items():
@@ -267,69 +252,45 @@ def collect_texts(obj, out):
 
 
 def fetch_full_prompt(client, item):
-    """متن کامل پرامپت را با get_inspiration می‌گیرد. اگر نشد None برمی‌گرداند."""
-    global _debug_shown
-    excerpt = item["excerpt"]
+    """متن کامل پرامپت را با get_inspiration می‌گیرد؛ در صورت شکست None."""
     try:
         result = client.call("get_inspiration", {"imageId": item["source_id"]})
     except Exception as e:
         print(f"   ❌ get_inspiration ناموفق: {e}")
         return None
 
-    if _debug_shown < 2:
-        _debug_shown += 1
-        print(f"   🧪 پاسخ خام get_inspiration (نمونه {_debug_shown}): "
-              f"{json.dumps(result, ensure_ascii=False)[:1500]}")
-
     payload = parse_payload(result)
+
+    # اولویت با فیلد «prompt»؛ فقط اگر نبود، بلندترین فیلد متنی
+    if isinstance(payload, dict) and isinstance(payload.get("prompt"), str) and payload["prompt"].strip():
+        return payload["prompt"].strip()
+
     texts = []
     collect_texts(payload, texts)
-
     if texts:
-        key, best = max(texts, key=lambda kv: len(kv[1]))
-        best = best.strip()
-        if len(best) >= len(excerpt) - 2:
-            print(f"   📝 متن کامل از فیلد «{key}»: {len(best)} کاراکتر (گزیده: {len(excerpt)})")
-            return best
+        return max(texts, key=lambda kv: len(kv[1]))[1].strip()
 
-    # گزیده‌های کوتاه‌تر از حد برش، احتمالاً خودشان کامل‌اند
-    if len(excerpt) < 110:
-        return excerpt
+    print(f"   ⚠️ فیلد متن در پاسخ پیدا نشد. پاسخ خام: {json.dumps(result, ensure_ascii=False)[:800]}")
     return None
 
 
 # ============================== تلگرام ==============================
-def split_text(text, size):
-    chunks, current = [], ""
-    for para in text.split("\n"):
-        while len(para) > size:
-            if current:
-                chunks.append(current)
-                current = ""
-            chunks.append(para[:size])
-            para = para[size:]
-        if len(current) + len(para) + 1 > size:
-            chunks.append(current)
-            current = para
-        else:
-            current = f"{current}\n{para}" if current else para
-    if current:
-        chunks.append(current)
-    return chunks
-
-
-def send_photo_to_telegram(photo_url, prompt_text):
+def send_to_telegram(photo_url, prompt_text):
+    """اگر متن کوتاه باشد داخل کپشن، وگرنه عکس + یک پیام ریپلای. همیشه حداکثر دو پیام."""
     prompt_text = prompt_text.strip()
     safe_prompt = escape_html(prompt_text)
-    caption = f"✨ <b>پرامپت جدید</b> ✨\n\n<code>{safe_prompt}</code>\n\n🔗 @prompts_fa"
     api = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
-    long_text = len(caption) > 1000
-    first_caption = "✨ <b>پرامپت جدید</b> ✨\n(متن کامل در پیام زیر 👇)" if long_text else caption
+
+    in_caption = len(prompt_text) <= CAPTION_MAX_CHARS
+    if in_caption:
+        caption = f"✨ <b>پرامپت جدید</b> ✨\n\n<code>{safe_prompt}</code>\n\n🔗 @prompts_fa"
+    else:
+        caption = "✨ <b>پرامپت جدید</b> ✨\n(متن کامل در پیام زیر 👇)"
 
     try:
         res = requests.post(f"{api}/sendPhoto", data={
             "chat_id": TELEGRAM_CHANNEL_ID, "photo": photo_url,
-            "caption": first_caption, "parse_mode": "HTML",
+            "caption": caption, "parse_mode": "HTML",
         }, timeout=30).json()
 
         if not res.get("ok"):
@@ -339,28 +300,23 @@ def send_photo_to_telegram(photo_url, prompt_text):
                 print(f"   ❌ دانلود عکس ناموفق: {img.status_code}")
                 return False
             res = requests.post(f"{api}/sendPhoto", data={
-                "chat_id": TELEGRAM_CHANNEL_ID, "caption": first_caption, "parse_mode": "HTML",
+                "chat_id": TELEGRAM_CHANNEL_ID, "caption": caption, "parse_mode": "HTML",
             }, files={"photo": ("prompt.jpg", img.content, "image/jpeg")}, timeout=40).json()
 
         if not res.get("ok"):
             print(f"   ❌ تلگرام: {res}")
             return False
 
-        if long_text:
-            reply_to = res["result"]["message_id"]
-            chunks = split_text(prompt_text, TELEGRAM_CHUNK)
-            for i, chunk in enumerate(chunks):
-                suffix = "\n\n🔗 @prompts_fa" if i == len(chunks) - 1 else ""
-                res_text = requests.post(f"{api}/sendMessage", data={
-                    "chat_id": TELEGRAM_CHANNEL_ID,
-                    "text": f"<code>{escape_html(chunk)}</code>{suffix}",
-                    "parse_mode": "HTML",
-                    "reply_to_message_id": reply_to,
-                }, timeout=25).json()
-                if not res_text.get("ok"):
-                    print(f"   ❌ ارسال متن ناموفق: {res_text}")
-                    return False
-                time.sleep(1)
+        if not in_caption:
+            res_text = requests.post(f"{api}/sendMessage", data={
+                "chat_id": TELEGRAM_CHANNEL_ID,
+                "text": f"<code>{safe_prompt}</code>\n\n🔗 @prompts_fa",
+                "parse_mode": "HTML",
+                "reply_to_message_id": res["result"]["message_id"],
+            }, timeout=25).json()
+            if not res_text.get("ok"):
+                print(f"   ❌ ارسال متن ناموفق: {res_text}")
+                return False
         return True
 
     except Exception as e:
@@ -374,8 +330,9 @@ if __name__ == "__main__":
         print("❌ متغیر TELEGRAM_BOT_TOKEN تنظیم نشده است.")
         exit(1)
 
-    print(f"⚙️ تنظیمات: ارسال در هر اجرا={MAX_POSTS_PER_RUN} | رد پرامپت‌های مرجع={SKIP_REFERENCE_PROMPTS} "
-          f"| الزام متن کامل={REQUIRE_FULL_PROMPT} | فقط community={ONLY_COMMUNITY}")
+    print(f"⚙️ تنظیمات: پست در هر اجرا={MAX_POSTS_PER_RUN} | سقف بررسی={MAX_CHECKS_PER_RUN} | "
+          f"سقف طول متن={MAX_PROMPT_CHARS} | حد کپشن={CAPTION_MAX_CHARS} | "
+          f"رد مرجع={SKIP_REFERENCE_PROMPTS} | فقط community={ONLY_COMMUNITY}")
     print(f"🔑 توکن MeiGen: {'تنظیم شده' if MEIGEN_API_TOKEN else 'تنظیم نشده (حالت بدون توکن)'}")
 
     sent_set, sent_list = load_sent_prompts()
@@ -383,64 +340,60 @@ if __name__ == "__main__":
     client = MCPClient(MCP_URL, MEIGEN_API_TOKEN)
     try:
         client.initialize()
-        tools = client.list_tools()
+        tool_names = [t["name"] for t in client.list_tools()]
     except Exception as e:
         print(f"❌ اتصال به MCP ناموفق بود: {e}")
         exit(0)
 
-    tool_names = [t["name"] for t in tools]
     if "search_gallery" not in tool_names or "get_inspiration" not in tool_names:
         print(f"⚠️ ابزارهای لازم پیدا نشد. ابزارها: {tool_names}")
         exit(0)
 
-    candidates = [i for i in fetch_candidates(client, sent_set) if i["is_new"]]
-    if not candidates:
-        print("⚠️ پرامپت جدیدی پیدا نشد.")
-        exit(0)
+    stats = {"sent": 0, "failed": 0, "no_full": 0, "ref": 0, "too_long": 0, "checked": 0}
 
-    print(f"🔍 {len(candidates)} کاندیدای جدید. شروع گرفتن متن کامل و ارسال...")
-
-    sent_count = failed_count = no_full_count = ref_after_count = 0
-
-    for it in candidates:
-        if sent_count >= MAX_POSTS_PER_RUN:
+    for it in iter_new_candidates(client, sent_set):
+        if stats["sent"] >= MAX_POSTS_PER_RUN:
             print(f"🛑 سقف ارسال این نوبت ({MAX_POSTS_PER_RUN}) تکمیل شد.")
             break
+        if stats["checked"] >= MAX_CHECKS_PER_RUN:
+            print(f"🛑 سقف بررسی این نوبت ({MAX_CHECKS_PER_RUN}) تکمیل شد.")
+            break
+        stats["checked"] += 1
 
-        print(f"📦 بررسی id={it['source_id']}")
+        print(f"📦 [{stats['checked']}] بررسی id={it['source_id']}")
         full = fetch_full_prompt(client, it)
         time.sleep(0.3)
 
         if not full:
-            no_full_count += 1
-            if REQUIRE_FULL_PROMPT:
-                print("   ⏭️ متن کامل پیدا نشد، رد شد (برای اجرای بعدی دوباره امتحان می‌شود).")
-                continue
-            full = it["excerpt"]
-
-        if SKIP_REFERENCE_PROMPTS and REFERENCE_RE.search(full):
-            ref_after_count += 1
-            print("   ⏭️ پرامپت به عکس مرجع نیاز دارد، رد شد.")
-            for k in (it["key"], it["legacy_key"]):  # دوباره بررسی نشود
-                sent_set.add(k)
-                sent_list.append(k)
+            stats["no_full"] += 1
+            print("   ⏭️ متن کامل گرفته نشد؛ ثبت نمی‌شود تا اجرای بعد دوباره امتحان شود.")
             continue
 
-        print(f"   📤 ارسال [{sent_count + 1}/{MAX_POSTS_PER_RUN}] | طول متن={len(full)}")
-        if send_photo_to_telegram(it["image_url"], full):
+        if SKIP_REFERENCE_PROMPTS and REFERENCE_RE.search(full):
+            stats["ref"] += 1
+            print(f"   ⏭️ نیاز به عکس مرجع دارد (طول {len(full)})، رد شد.")
+            mark_done(it, sent_set, sent_list)
+            continue
+
+        if len(full) > MAX_PROMPT_CHARS:
+            stats["too_long"] += 1
+            print(f"   ⏭️ بیش از حد بلند است ({len(full)} > {MAX_PROMPT_CHARS})، رد شد.")
+            mark_done(it, sent_set, sent_list)
+            continue
+
+        mode = "کپشن" if len(full) <= CAPTION_MAX_CHARS else "عکس + یک پیام ریپلای"
+        print(f"   📤 ارسال [{stats['sent'] + 1}/{MAX_POSTS_PER_RUN}] | طول={len(full)} | قالب: {mode}")
+        if send_to_telegram(it["image_url"], full):
             print("   ✅ ارسال شد.")
-            for k in (it["key"], it["legacy_key"]):
-                sent_set.add(k)
-                sent_list.append(k)
-            sent_count += 1
+            mark_done(it, sent_set, sent_list)
+            stats["sent"] += 1
             time.sleep(SEND_DELAY_SECONDS)
         else:
-            failed_count += 1
-            print("   ❌ ارسال ناموفق.")
+            stats["failed"] += 1
+            print("   ❌ ارسال ناموفق (ثبت نمی‌شود، بار بعد دوباره امتحان می‌شود).")
 
-    save_sent_prompts(sent_list)
-
-    print(f"🏁 پایان: ارسال‌شده={sent_count} | ناموفق={failed_count} | بدون متن کامل={no_full_count} "
-          f"| رد (مرجع)={ref_after_count} | کل کلیدهای ذخیره‌شده={len(sent_list)}")
-    if sent_count == 0:
+    print(f"🏁 پایان: ارسال‌شده={stats['sent']} | ناموفق={stats['failed']} | بررسی‌شده={stats['checked']} | "
+          f"رد(مرجع)={stats['ref']} | رد(بیش از حد بلند)={stats['too_long']} | بدون متن کامل={stats['no_full']} | "
+          f"کل کلیدهای ذخیره‌شده={len(sent_list)}")
+    if stats["sent"] == 0:
         print("💤 هیچ پرامپتی ارسال نشد.")
