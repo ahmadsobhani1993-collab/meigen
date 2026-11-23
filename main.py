@@ -15,7 +15,7 @@ TOTAL_PAGES_TO_SCAN = 7
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Referer": "https://www.meigen.ai",
+    "Referer": "https://www.meigen.ai/app",
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9"
 }
@@ -26,9 +26,6 @@ def escape_html(text):
     return text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
 
 def make_unique_key(item_id, prompt_text):
-    """
-    تولید شناسه کاملاً یکتا بر اساس شناسه ثابت تصویر در سایت و متن پرامپت
-    """
     clean_prompt = " ".join(str(prompt_text).strip().split()).lower()
     raw = f"{str(item_id).strip()}::{clean_prompt}"
     return hashlib.sha256(raw.encode('utf-8')).hexdigest()
@@ -99,12 +96,14 @@ def fetch_prompts():
 
     for page in range(TOTAL_PAGES_TO_SCAN):
         offset = page * 20
-        # فراخوانی با sort=popular یا بدون سورت برای جلوگیری از shuffle شدن نتایج
         api_url = f"https://www.meigen.ai/api/images?offset={offset}&limit=20"
         
         try:
             res = scraper.get(api_url, headers=HEADERS, timeout=15)
+            print(f"🌐 بررسی صفحه {page+1} (آفست {offset}) - کد وضعیت: {res.status_code}")
+            
             if res.status_code != 200:
+                print(f"⚠️ پاسخ سرور برای این صفحه: {res.text[:200]}...")
                 continue
                 
             data = res.json()
@@ -118,6 +117,7 @@ def fetch_prompts():
                         break
 
             if not items:
+                print(f"⚠️ در صفحه {page+1} آیتمی یافت نشد یا ساختار JSON تغییر کرده است.")
                 break
 
             for it in items:
@@ -147,7 +147,7 @@ def fetch_prompts():
                         })
 
         except Exception as e:
-            print(f"   ❌ خطا در آفست {offset}: {e}")
+            print(f"   ❌ خطا در ارتباط با آفست {offset}: {e}")
 
     return all_items
 
@@ -174,7 +174,6 @@ if __name__ == "__main__":
 
         ukey = it["key"]
 
-        # چک کردن سابقه
         if ukey in sent_set:
             continue
 
